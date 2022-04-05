@@ -129,7 +129,8 @@ cat >>$1<< 'EOF'
 # last modified 2022-04-04
 [NESSESSARY]
 BORG_PASSPHRASE="sSLKuUGpUEsE-7Zmlkxx-WnODksMt9h56XS4id4yJDoT97XMuQsDLvz4c7XyiL"
-SALT="wOiBupNyV"
+BORG_SALT="wOiBupNyV"
+# N.B. BORG_SALT must be at least 8 octets in length
 
 # set the (preferably remote) location where borg should store your data #
 BORG_REPO="/media/borg"
@@ -182,15 +183,15 @@ ASSIMILATE="sudo $PKG_MGR install -y argon2 rsync borgbackup jq"
 #BORG_KEYS_DIR='~/.smb/cloud/.config/borg/keys'
 #BORG_SECURITY_DIR='~/.smb/cloud/.config/borg/security' 
 
-# while [ $(echo "$SALT"|tr -d '\n'|wc -c) -lt 8 ]; do SALT="$SALT$(whoami)"; done
+# while [ $(echo "$BORG_SALT"|tr -d '\n'|wc -c) -lt 8 ]; do BORG_SALT="$BORG_SALT$(whoami)"; done
 
 #
-#BORG_PASSCOMMAND="$(echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r)" [e]
-#BORG_PASSCOMMAND=$(echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r) # [e] no such command
-##BORG_PASSCOMMAND="echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r" [e]
-##BORG_PASSCOMMAND='echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r' [e]
+#BORG_PASSCOMMAND="$(echo $BORG_PASSPHRASE|argon2 $BORG_SALT -t 17 -m 13 -p 1 -l 64 -r)" [e]
+#BORG_PASSCOMMAND=$(echo $BORG_PASSPHRASE|argon2 $BORG_SALT -t 17 -m 13 -p 1 -l 64 -r) # [e] no such command
+##BORG_PASSCOMMAND="echo $BORG_PASSPHRASE|argon2 $BORG_SALT -t 17 -m 13 -p 1 -l 64 -r" [e]
+##BORG_PASSCOMMAND='echo $BORG_PASSPHRASE|argon2 $BORG_SALT -t 17 -m 13 -p 1 -l 64 -r' [e]
 # N.B. does NOT run with either single or double quotes (this can probably be fixed)
-BORG_PASSCOMMAND=echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r
+BORG_PASSCOMMAND=echo $BORG_PASSPHRASE|argon2 $BORG_SALT -t 29 -m 14 -p 1 -l 128 -r
 
 # BORG_KEY is currently about char(500) so no need for a passphrase longer than that
 # N.B. we MUST remove BORG_PASSPHRASE because borg defaults to BORG_PASSPHRASE and
@@ -441,7 +442,7 @@ CREATE_FLAGS="$(echo "$CONFIG"|grep '^ADVANCED|CREATE_FLAGS|'|cut -d'|' -f3-|tr 
 PRUNE_FLAGS="$(echo "$CONFIG"|grep '^ADVANCED|PRUNE_FLAGS|'|cut -d'|' -f3-|tr -d '"')"
 ARCHIVE_NAME="$(echo "$CONFIG"|grep '^ADVANCED|ARCHIVE_NAME|'|cut -d'|' -f3-|tr -d '"')"
 export BORG_PASSPHRASE="$(echo "$CONFIG"|grep '^NESSESSARY|BORG_PASSPHRASE|'|cut -d'|' -f3-|tr -d '"')"
-export SALT="$(echo "$CONFIG"|grep '^NESSESSARY|SALT|'|cut -d'|' -f3-|tr -d '"')"
+export BORG_SALT="$(echo "$CONFIG"|grep '^NESSESSARY|BORG_SALT|'|cut -d'|' -f3-|tr -d '"')"
 BORG_PASSCOMMAND="$(echo "$CONFIG"|grep '^ADVANCED|BORG_PASSCOMMAND|'|cut -d'|' -f3-|tr -d '"')"
 
 BORG_REPO="$HOME/var/borg" # hardcoded default
@@ -486,19 +487,19 @@ second_sanity(){
 
     # if we have a valid BORG_PASSCOMMAND then remove BORG_PASSPHRASE (or borg will use that.)
 
-    #log "SALT := $(echo $SALT)" #without `export`
+    #log "BORG_SALT := $(echo $BORG_SALT)" #without `export`
     #log "PASSPHRASE := $(echo $BORG_PASSPHRASE)" # without `export`
-    #log "SALT := $SALT" # with `export`
+    #log "BORG_SALT := $BORG_SALT" # with `export`
     #log "PASSPHRASE := $BORG_PASSPHRASE" # with `export`
 
     #log "PASS_CMD := $(sh -c "printf \"%s\" \"$(echo $BORG_PASSCOMMAND)\"")"
-    BPC="$(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
-    #export BORG_PASSCOMMAND="echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'" # runs, (but is it actually using argon2?)
+    BPC="$(echo $BORG_PASSCOMMAND|sed 's/\$BORG_SALT/'$BORG_SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
+    #export BORG_PASSCOMMAND="echo $BORG_PASSCOMMAND|sed 's/\$BORG_SALT/'$BORG_SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'" # runs, (but is it actually using argon2?)
     export BORG_PASSCOMMAND="$BPC"
-    #export BORG_PASSCOMMAND="$( sh -c "echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'")" # interpolates too far
+    #export BORG_PASSCOMMAND="$( sh -c "echo $BORG_PASSCOMMAND|sed 's/\$BORG_SALT/'$BORG_SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'")" # interpolates too far
     #export BORG_PASSCOMMAND="$BORG_PASSCOMMAND" #fails
-    #PASS_CMD=$(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')
-    #log "PASS_CMD := $(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
+    #PASS_CMD=$(echo $BORG_PASSCOMMAND|sed 's/\$BORG_SALT/'$BORG_SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')
+    #log "PASS_CMD := $(echo $BORG_PASSCOMMAND|sed 's/\$BORG_SALT/'$BORG_SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
     #log "PASS_CMD := $PASS_CMD"
     #  WHY won't /bin/dash won't expand string variables like a nice normal shell!!
 
@@ -526,7 +527,7 @@ second_sanity(){
       borg init $INIT_FLAGS $BORG_REPO
       borg upgrade --tam $BORG_REPO
       borg key export $(date +%F_%T)_COPY_OF_YOUR_BORG.KEY
-      log 3 "You should make multiple safe copies of $(ls -l COPY_OF_YOUR_BORG.KEY)" 
+      log 3 "You should make multiple safe copies of $(ls -l *COPY_OF_YOUR_BORG.KEY)" 
     fi
 
     if [ -f "$BORG_REPO/lock.roster" ]&&[ ! "$(ps auwxf|grep -v grep|grep borg|awk '{print $2}')" ]; then
@@ -785,8 +786,8 @@ desktop_notify(){
 }
 
 inspect_archive() {
-        # to recover we need a valid $BORG_PASSCOMMAND, to do that we export the SALT and BORG_PASSPHRASE
-        export $(grep ^SALT ~/.config/cube/config.ini)
+        # to recover we need a valid $BORG_PASSCOMMAND, to do that we export the BORG_SALT and BORG_PASSPHRASE
+        export $(grep ^BORG_SALT ~/.config/cube/config.ini)
         export $(grep ^BORG_PASSPHRASE ~/.config/cube/config.ini);
         export $(grep ^BORG_REPO ~/.config/cube/config.ini|tr -d '"')
         grep ^BORG_PASSC ~/.config/cube/config.ini|sed 's/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'|tr -d '"'|sed 's/=/="/;s/$/"/'
@@ -805,7 +806,7 @@ inspect_archive() {
 recover() {
         sudo apt install -y argon2 rsync jq borgbackup
         HOST=$([ "${HOSTNAME}" ]&& printf $HOSTNAME || printf 'acer')
-        eval "$(grep -E '^SALT|^export' $(which archive))"; mkdir -p ~/.mnt/g/ 2>/dev/null
+        eval "$(grep -E '^BORG_SALT|^export' $(which archive))"; mkdir -p ~/.mnt/g/ 2>/dev/null
         rsync -mauvPAX ${BORG_REPO%/*}/borg_${HOST}_keys/keys  ~/.config/borg/
         borg mount ${BORG_REPO}::$(borg list|grep ${HOST}|tail -n2|head -n1|awk '{print $1}') ~/.mnt/g/
         # rsync -mauvPAX ~/.mnt/g/home/$(whoami)/vital/files.txt  ~/vital/files.txt 
