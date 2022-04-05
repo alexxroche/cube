@@ -11,12 +11,12 @@ cd ~/.local/bin
 curl -sL https://raw.githubusercontent.com/alexxroche/cube/main/hash.blake2 -o ~/.local/bin/.cube.b2
 curl -sL https://raw.githubusercontent.com/alexxroche/cube/main/hash.sha256 -o ~/.local/bin/.cube.sha256
 curl -sL https://raw.githubusercontent.com/alexxroche/cube/main/cube -o ~/.local/bin/cube
+chmod 0555 ~/.local/bin/cube
+chmod 0444 ~/.local/bin/{.cube.b2,.cube.sha256} 
 which b2sum >/dev/null && b2sum -c ~/.local/bin/.cube.b2 && ~/.local/bin/cube \
 || { 
     sha256sum -c ~/.local/bin/.cube.sha256 && ~/.local/bin/cube || echo "[e] cube hashes failed. Do not use" 
 }
-chmod 0555 ~/.local/bin/cube
-chmod 0444 ~/.local/bin/{.cube.b2,.cube.sha256} 
 ```
 
 ### ABOUT
