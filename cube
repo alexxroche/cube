@@ -265,7 +265,9 @@ sanity(){
         if echo "$yn"|grep -qiE 'o(ui)?|y(es)?'; then # [y|yes|Y|YES|oui]
             sudo apt-get update 2>/dev/null # debianism
             # works for CentOS and debian, (and all apt distros derived from debian... which is many.)
-            sudo $(eval $(grep PKG_MGR= ~/.config/cube/config.ini|cut -d= -f2|tr -d '"')|head -n1) install argon2 || \
+            for dependency in $DEPS_FAIL; do
+                sudo $(eval $(grep PKG_MGR= ~/.config/cube/config.ini|cut -d= -f2|tr -d '"')|head -n1) install -y $dependency
+            done
         else
             log "Unable to continue without required depencencies. {You wIn tHiS Time Janeway!}."
             exit 1
