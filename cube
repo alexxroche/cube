@@ -1,0 +1,822 @@
+#!/bin/sh
+# cube ver. 20220404110614 Copyright 2022 alexx, MIT License
+# RDFa:deps="[borg=backup jq argon2 rsync]"
+usage(){ 
+    printf "Usage: $(basename $0) [-h|-export_key|-export_key_without_passphrase|show_passphrase|list|recover]
+\t -h This help message
+\t -check N.B. incompatible with a mounted backup
+\t -info
+\t -export_key 'Will write the key to a file in pwd:($(pwd)) in the form <{datetime}_COPY_OF_YOUR_BORG.KEY>'
+\t -export_key_without_passphrase 'experimentally removed passphrase from key'
+\t -show_passphrase ' for debug purporses'
+\t -list the backups in the repo 
+\t -recover a backup by mounting the penultimate backup
+\t -umount unmount a recovered backup
+\t -info  ...mation about the repo
+\t   N.B. All BORG_VARIABLES can be submitted using -BORG_PASSPHRASE=\"example_passPhrase\"
+"; 
+    exit 0;
+}
+[ "$1" ]&& echo "$1"|grep -q '\-h' && usage
+
+### ABOUT ###
+#
+#   cube is a wrapper to borgbackup for human users. [0]
+# It is able to install borg and enough config to back itself up.
+#
+# The presumption is that you will have a NAS to which you want to backup,
+#  and that you will have cube run by cron because "If a human has to be
+#  involved, then it is a snapshot and NOT a backup!"
+#
+# [0] and totally not a way to remove resistence, {~~is futile~~} to addoption.
+#
+ 
+# The config file dictates the actions of cube.
+# It expects to have a list of file & directories to include
+#  and files & directories to exclude.
+# e.g. FILTER="$HOME/.config/cube/filter.json"
+
+CONFIG_PATH="$HOME/.config/cube"
+CONFIG_FILE="$CONFIG_PATH/config.ini"
+
+### sanity ###
+
+BORG_MNT="/mnt/cube"
+
+cron=$(tty -s;echo $?)
+is_a_number () {
+  #known BUG: will match against "-" as "is_a_number" and not "+"
+   if [ "$1" -eq "$1" ] 2>/dev/null || echo "$1" | grep -q '^-*[0-9]*\.*[0-9]*$';then
+      if ! echo "$1" | grep -q '^--' && ! echo "$1" | grep -q '\.\.';then #check that we don't have -- or ..
+         echo 1
+      fi
+   fi
+}
+
+#######
+# log #
+#######
+# this replaced echo in a form that will squelch the noise if the same script
+# is run from cron.
+#
+# Usage:  log [1|2|3|-1|0] "INFO or WARNING or ERROR with option to stdout (1) or stderr (2) or /dev/null (3)
+# log "This message will go to stdout ; also works with log 1 messge for user"
+# log 2 "WARNING: This message will go to stderr!"
+# log 3 "This message will not be displayed"
+
+
+log() {
+  if ( [ "$cron" ] && [ "$cron" -eq 1 ] ) || ( [ "$DEBUG" ] && [ "$DEBUG" -lt 1 ] );then
+    #continue
+    return
+  #  echo "[inside log()] $DEBUG" >&2
+  else
+    if [ "$2" ]&&[ "$(is_a_number $1)" ]&&[ "$1" -eq 1 ]; then
+      shift             # INFO
+      echo "[i] $@" # be careful that this isn't assimilated
+    elif [ "$2" ]&&[ "$(is_a_number $1)" ]&&[ "$1" -eq 0 ]; then
+      shift             # LOG
+      echo "[$(date '+%F %T')] $@" >&2
+    elif [ "$2" ]&&[ "$(is_a_number $1)" ]&&[ "$1" -lt 0 ]; then
+      shift             # RAW
+      echo "$@" >&2
+    elif [ "$2" ]&&[ "$(is_a_number $1)" ]&&[ "$1" -eq 2 ]; then
+      shift             # WARN
+      echo "[w] $@" >&2
+    elif [ "$1" ]&&[ ! "$2" ]; then
+      echo "[d] $@" >&2 # DEBUG
+    elif [ ! "$(is_a_number $1)" ]; then
+      echo "[e] $@" >&2 # ERROR
+    fi
+  fi
+  #echo "[leaving log()] $DEBUG" >&2
+}
+
+say(){
+  # like log() but without the DEBUG
+  OLD_DEBUG=$DEBUG; DEBUG=1
+  log -1 $*
+  DEBUG=$OLD_DEBUG
+}
+
+info() { printf "\n%s %s\n\n" "$( date )" "$*" >&2; }
+trap 'echo $( date ) Backup interrupted >&2; exit 2' INT TERM
+
+leave() {
+    # clean up
+    # e.g. rm "/tmp/$(basename "$0")_$$.conf" 2>/dev/null
+    exit "$1"
+}
+
+#export _usage='
+#log 1 "Usage example to stdout"
+#log 2 "example to stderr"
+#log "this defaults to stderr"
+#leave 45
+#'
+
+install_example_config(){
+
+# check that we know which file to create
+[ "$1" ]||return
+# and don't blat an existing file
+[ -f "$1" ]&&return
+
+[ -d "$(dirname $1)" ]|| mkdir -p $(dirname $1)
+
+log "creating example config: $1"
+cat >>$1<< 'EOF'
+# last modified 2022-04-04
+[NESSESSARY]
+BORG_PASSPHRASE="sSLKuUGpUEsE-7Zmlkxx-WnODksMt9h56XS4id4yJDoT97XMuQsDLvz4c7XyiL"
+SALT="wOiBupNyV"
+
+# set the (preferably remote) location where borg should store your data #
+BORG_REPO="/media/borg"
+#BORG_REPO="/media/$USER/NAS/backup/borg"
+
+# what to include and exclude. Defaults to include cube and exclude caches.
+FILTER_FILE="$HOME/.config/cube/filter.json"
+FILTER_FORMAT="JSON"
+FILTER_FORMAT_JSON_EXCLUDE_CMD="jq -r '.EXCLUDE | .[]' $FILTER_FILE"
+FILTER_FORMAT_JSON_INCLUDE_CMD="jq -r '.INCLUDE | .[]' $FILTER_FILE"
+
+# a script to run befor invoking borg (maybe `sudo rsync - /var/www/wg.lan ~/var/www/`).
+BEGIN_SCRIPT=
+
+[OFF_SIGHT]
+
+# Then you can set a cron on your NAS to rsync that over to a remote server
+#  or "an old box sat on the end of a friends DSL line", to have remote backup.
+RSYNC_ARGS="-mauvPAX"
+SERVERS="[203.0.113.2:22 [2001:DB8::cb00:7102]:4321]
+
+[ADVANCED]
+
+#::'{hostname}_{utcnow:%Y-%m-%dT%H%M%S}' \ # has a space that is dull to deal with in shell
+#::'{hostname}_{now}'         \ #has a space between date and time (which makes diff a pain)
+#::'{hostname}_{pid}'         \ # doesn't sort chronologically
+ARCHIVE_NAME="::'{hostname}_{utcnow:%Y-%m-%d_%H:%M:%S}'"
+
+#read -r CREATE_FLAGS <<-'EOF'
+#    --verbose
+#    --filter AME
+#    --list
+#    --stats
+#    --show-rc
+#    --compression lzma,9
+#    --exclude-caches
+#EOF
+
+#INIT_FLAGS="--encryption=repokey" # legacy
+INIT_FLAGS="--encryption keyfile-blake2"
+CREATE_FLAGS="--verbose --filter AME --list --stats --show-rc --compression zstd,22 --exclude-caches" # max compression
+#CREATE_FLAGS="--verbose --filter AME --list --stats --show-rc --compression lzma,9 --exclude-caches" # legacy compatability
+PRUNE_FLAGS=" --list --prefix '{hostname}_' --show-rc --keep-hourly 2 --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 100"
+PKG_MGR="which apt-get apt yum"
+ASSIMILATE="sudo $PKG_MGR install -y argon2 rsync borgbackup jq"
+
+#BORG_KEYS_DIR='~/.config/borg/keys'
+#BORG_SECURITY_DIR='~/.config/borg/security' 
+#BORG_KEYS_DIR='~/.smb/cloud/.config/borg/keys'
+#BORG_SECURITY_DIR='~/.smb/cloud/.config/borg/security' 
+
+# while [ $(echo "$SALT"|tr -d '\n'|wc -c) -lt 8 ]; do SALT="$SALT$(whoami)"; done
+
+#
+#BORG_PASSCOMMAND="$(echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r)" [e]
+#BORG_PASSCOMMAND=$(echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r) # [e] no such command
+##BORG_PASSCOMMAND="echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r" [e]
+##BORG_PASSCOMMAND='echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r' [e]
+# N.B. does NOT run with either single or double quotes (this can probably be fixed)
+BORG_PASSCOMMAND=echo $BORG_PASSPHRASE|argon2 $SALT -t 17 -m 13 -p 1 -l 64 -r
+
+# BORG_KEY is currently about char(500) so no need for a passphrase longer than that
+# N.B. we MUST remove BORG_PASSPHRASE because borg defaults to BORG_PASSPHRASE and
+#  that bypasses our lovely BORG_PASSCOMMAND, (and the power of argon2) which we
+#  do NOT want to accidentally do. [Don't ask.]
+
+### some of the other BORG config variables ###
+###  `man borg` to find out how and why     ###
+
+#BORG_PASSPHRASE_FD=""
+#BORG_NEW_PASSPHRASE=
+#BORG_DISPLAY_PASSPHRASE="No! Do not enable this except to DEBUG"
+BORG_HOSTNAME_IS_UNIQUE=no
+#BORG_HOST_ID="0C:9E:EB:F8:97:8F"
+#BORG_WORKAROUNDS
+#BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=no # (or =yes)
+#BORG_RELOCATED_REPO_ACCESS_IS_OK=no # (or =yes)
+#BORG_KEY_FILE=
+EOF
+
+[ -f "$(dirname $1)/config.ini" ]|| mv "$1" "$(dirname $1)/config.ini"
+}
+
+install_example_filter(){
+[ "$1" ]||return
+[ -f "$1" ]&&return
+log "creating example filter: $1"
+cat >>$1<< 'EOF'
+{
+ "INCLUDE": [
+    "/etc",
+    "/usr/local/bin",
+    "/usr/local/sbin"
+ ],
+ "EXCLUDE": [
+    "*/.cache/*",
+    "*/.git/*",
+    "*/.npm/*",
+    "/home/*",
+    "*/.thumbnails/*",
+    "/var/cache/*",
+    "/var/tmp/*",
+    "/tmp/*",
+    "/media/*",
+    "*.LOCK"
+ ]
+}
+EOF
+[ -f "$(dirname $1)/filter.json" ]|| mv "$1" "$(dirname $1)/filter.json"
+}
+assimilate(){
+  # build the cube
+    #log "installing example config file in $CONFIG_PATH/example_config.ini"
+    install_example_config "$CONFIG_PATH/example_config.ini"
+    #log "installing example filter in $CONFIF_PATH"
+    install_example_filter "$CONFIG_PATH/example_filter.json"
+}
+
+sanity(){
+    # check that borg is installed
+    DEPS=$(grep -i "#\s*rdfa\?:deps=\"\[.*\]\"" $0|sed "s,.*=\"\[,,;s,\]\",,;s/,/\n/g")
+    #log 1 "located deps list: $DEPS" #DEBUG
+    DEPS_FAIL=
+    for dependency in $DEPS; do
+        d="${dependency%=*}"
+       #[ "$(which $dependency)" ] && log "found $dependency" || DEPS_FAIL="$DEPS_FAIL $dependency"  #DEBUG
+       [ "$(which $d)" ] || DEPS_FAIL="$DEPS_FAIL $dependency" 
+    done
+    if [ "$DEPS_FAIL" ]; then
+        # offer to ~~assimilate~~ install borg and deps
+        log "Failed to locate dependences: $DEPS_FAIL : shall I install it: [Y|n] "
+        read -r yn
+        if echo "$yn"|grep -qiE 'o(ui)?|y(es)?'; then # [y|yes|Y|YES|oui]
+            sudo apt-get update 2>/dev/null # debianism
+            # works for CentOS and debian, (and all apt distros derived from debian... which is many.)
+            sudo $(eval $(grep PKG_MGR= ~/.config/cube/config.ini|cut -d= -f2|tr -d '"')|head -n1) install argon2 || \
+        else
+            log "Unable to continue without required depencencies. {You wIn tHiS Time Janeway!}."
+            exit 1
+        fi
+    fi
+    if [ ! -x "$(which argon2)" ];then
+        sudo apt-get update 2>/dev/null # debianism
+        # works for CentOS and debian, (and all apt distros derived from debian... which is many.)
+        sudo $(eval $(grep PKG_MGR= ~/.config/cube/config.ini|cut -d= -f2|tr -d '"')|head -n1) install argon2 || \
+        mkdir -p /usr/local/src \
+        cd /usr/local/src \
+        git clone https://github.com/P-H-C/phc-winner-argon2.git \
+        cd phc-winner-argon2 \
+        make \
+        sudo make install
+        # we are really cloning from github? Why don't we just include the argon2 src?
+    fi
+
+    # check that a config exists
+    [ -f "$CONFIG_FILE" ]|| {
+        log "Unable to locate config file [$CONFIG_FILE], beginning instillation"
+        assimilate
+    }
+    #log 1 "Sanity verified"
+} #/sanity()
+sanity
+
+### Import config ###
+
+legacy_parse_config(){
+
+echo "Reading system-wide config...." >&2
+. /etc/cube/config.ini
+if [ -r ~/.config/cube/config.ini ]; then
+  echo "Reading user config...." >&2
+  . ~/.config/cube/config.ini
+fi
+} #/legacy_parse_config()
+
+parse_config(){
+
+# commented lines, empty lines und lines of the from choose_ANYNAME='any.:Value' are valid
+CONFIG_SYNTAX="^\s*#|^\s*$|^[a-zA-Z_]+='[^']*'$"
+
+# check if the file contains something we don't want
+if egrep -q -v "${CONFIG_SYNTAX}" "$CONFIG_FILE"; then
+  echo "Error parsing config file ${CONFIG_FILE}." >&2
+  echo "The following lines in the configfile do not fit the syntax:" >&2
+  egrep -vn "${CONFIG_SYNTAX}" "$CONFIG_FILE"
+  exit 5
+fi
+
+# otherwise go on and source it:
+source "${CONFIG_FILE}"
+} #/parse_config()
+
+parse_config_ini(){
+# RDFs:src="https://web.archive.org/web/20151023055736/http://unix-workstation.blogspot.de/2015/06/configuration-files-for-shell-scripts.html"
+
+CONFIG_INI="$CONFIG_FILE"
+
+CONFIG="$(
+# remove comments
+#  then remove "INI comments actually start with ';'" 
+#  then remove blank lines
+ sed 's/^\s*#.*//;s/^\s*;//;/^\s*$/d' $CONFIG_INI | \
+sed '
+# Configuration bindings found outside any section are given to
+# to the default section.
+1 {
+  x
+  s/^/default/
+  x
+}
+
+# Lines starting with a #-character are comments.
+/^#/n
+/^\s#.*/n
+/^\s*;/n
+
+# Sections are unpacked and stored in the hold space.
+/^\[/ {
+  s/\[\(.*\)\]/\1/
+  x
+  b
+}
+
+# Bindings are unpacked and decorated with the section
+# they belong to, before being printed.
+/=/ {
+  s/^[[:space:]]*//
+  s/[[:space:]]*=[[:space:]]*/|/
+  G
+  s/\(.*\)\n\(.*\)/\2|\1/
+  p
+}
+' |sort -u
+)"
+
+} #/parse_config_ini()
+
+parse_config_ini
+#echo "$CONFIG" ; exit 1
+
+### include and exclude ###
+
+FILTER_FILE="$(echo "$CONFIG"|grep '^NESSESSARY|FILTER_FILE|'|cut -d'|' -f3|tr -d '"')"
+FILTER_FORMAT="$(echo "$CONFIG"|grep '^NESSESSARY|FILTER_FORMAT|'|cut -d'|' -f3)"
+
+#echo "$FILTER_FILE"
+
+if [ "$FILTER_FORMAT" = "JSON" ]||echo "$FILTER_FILE"|grep -q '\.json'; then
+  INCLUDE="$(echo "$CONFIG"|grep '^NESSESSARY|FILTER_FORMAT_JSON_INCLUDE_CMD|'|cut -d'|' -f3-)"
+  EXCLUDE="$(echo "$CONFIG"|grep '^NESSESSARY|FILTER_FORMAT_JSON_EXCLUDE_CMD|'|cut -d'|' -f3-|tr -d '"')"
+
+  INCLUDE="$(echo "$INCLUDE"|sed "s;jq ;$(which jq) ;"|tr -d '"')"
+  INCLUDE="$(echo "$INCLUDE"|sed "s;\$FILTER_FILE;$FILTER_FILE;")"
+  EXCLUDE="$(echo "$EXCLUDE"|sed "s;jq ;$(which jq) ;"|tr -d '"')"
+  EXCLUDE="$(echo "$EXCLUDE"|sed "s;\$FILTER_FILE;$FILTER_FILE;")"
+  #log $INCLUDE
+  INC=
+  EXC=
+
+  if [ ! "$THIS_SHELL" ]; then THIS_SHELL="$(readlink /proc/$$/exe)"; fi
+
+  if echo "$THIS_SHELL"|grep -q "bash"; then
+    INC=$(eval $INCLUDE) #bashism
+    EXC=$(eval $EXCLUDE) #bashism
+  elif [ -x "$(which bash)" ]; then
+    INC=$(bash -c "eval \"$INCLUDE\"") #outsource
+    EXC=$(bash -c "eval \"$EXCLUDE\"") #outsource
+  elif echo "$THIS_SHELL"|grep -q "dash"; then
+    TMP_FILE="$(mktemp -p /tmp --suffix=_cube)"
+
+    # because /bin/dash hates you
+    [ -f "$TMP_FILE" ]&& {
+      #echo "#!/bin/sh\n$INCLUDE" >$TMP_FILE
+      cat >>$TMP_FILE<<EOF
+#!/bin/sh
+  $INCLUDE
+EOF
+      chmod 0755 $TMP_FILE
+     }
+    INC=$($TMP_FILE)
+    rm $TMP_FILE
+
+    TMP_EXC_FILE="$(mktemp -p /tmp --suffix=_cube)"
+    [ -f "$TMP_EXC_FILE" ]&& {
+      echo "#!/bin/sh\n$EXCLUDE" >$TMP_EXC_FILE
+#      cat >>$TMP_EXC_FILE<<EOF
+##!/bin/sh
+#  $EXCLUDE
+#EOF  
+      chmod 0755 $TMP_EXC_FILE
+     }
+    log $TMP_EXC_FILE
+    EXC=$($TMP_EXC_FILE)
+    rm $TMP_EXC_FILE
+  fi
+  #log 0 "$EXC"
+
+
+else
+    log "Unknown FILTER_FORMAT,, maybe you could assimilate it into the cube?"
+fi
+E="$(for e in $EXC; do printf " --exclude %s" "$e"; done)"
+#E="$(for e in $EXC; do echo " --exclude $e"; done)"
+INIT_FLAGS="$(echo "$CONFIG"|grep '^ADVANCED|INIT_FLAGS|'|cut -d'|' -f3-|tr -d '"'|sed 's/\s*#.*//')"
+CREATE_FLAGS="$(echo "$CONFIG"|grep '^ADVANCED|CREATE_FLAGS|'|cut -d'|' -f3-|tr -d '"'|sed 's/\s*#.*//')"
+PRUNE_FLAGS="$(echo "$CONFIG"|grep '^ADVANCED|PRUNE_FLAGS|'|cut -d'|' -f3-|tr -d '"')"
+ARCHIVE_NAME="$(echo "$CONFIG"|grep '^ADVANCED|ARCHIVE_NAME|'|cut -d'|' -f3-|tr -d '"')"
+export BORG_PASSPHRASE="$(echo "$CONFIG"|grep '^NESSESSARY|BORG_PASSPHRASE|'|cut -d'|' -f3-|tr -d '"')"
+export SALT="$(echo "$CONFIG"|grep '^NESSESSARY|SALT|'|cut -d'|' -f3-|tr -d '"')"
+BORG_PASSCOMMAND="$(echo "$CONFIG"|grep '^ADVANCED|BORG_PASSCOMMAND|'|cut -d'|' -f3-|tr -d '"')"
+
+BORG_REPO="$HOME/var/borg" # hardcoded default
+#REPO_STR="$(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3-|tr -d '"')"
+#sh -c "echo $REPO_STR" >&2
+#export BORG_REPO="$(sh -c "echo $REPO_STR")"
+# dash string interpolate and expansion is a hot mess, (or I just don't know how this should be done to cover all cases of {"~/.borg","${HOME}/.borg"}
+export BORG_REPO="$(sh -c "echo $(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3)")" # works
+#export BORG_REPO="$(echo $(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3))" # fails to interpolate $HOME
+#export BORG_REPO="$(sh -c "printf "$(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3)"")" #works and is "quoted"
+#export BORG_REPO="$(printf "$(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3)")" # fails to interpolate $HOME
+#export BORG_REPO="$(sh -c "readlink -f "$REPO_STR"")" #works
+#export BORG_REPO="$(sh -c "readlink -fn "$(echo "$CONFIG"|grep '^NESSESSARY|BORG_REPO|'|cut -d'|' -f3)"")" # works and evaluates REPO directory
+    
+#[ -d "$BORG_REPO" ]|| log "did [$REPO_STR] not interpolate as you wanted?"
+
+##BORG_REPO="$(/bin/readlink -fn "$REPO_STR")"
+## because /bin/dash hates you
+##BR_TMP_FILE="$(mktemp -p /tmp --suffix=_cube)"
+##if [ -f "$BR_TMP_FILE" ]; then
+##  printf "#!/bin/sh\nreadlink -fn \"%s\" " "$REPO_STR" >$BR_TMP_FILE
+###  cat >>"$BR_TMP_FILE"<<EOF
+####!/bin/sh
+###  readlink -fn "$REPO_STR"
+###EOF   
+##  chmod 0755 "$BR_TMP_FILE"
+##fi
+##export BORG_REPO="$($BR_TMP_FILE)"
+##rm $BR_TMP_FILE
+#
+##BORG_REPO=$(bash -c "echo $BORG_REPO") #bashism
+
+
+second_sanity(){
+    # now that we have all of the variables, we need to check that they make sense
+    #  and that they are internally consistent
+
+    # TODO check that we have a salt
+
+
+    # TODO check that "prefix" in $PRUNE_FLAGS is consistent with $ARCHIVE_NAME
+
+    # if we have a valid BORG_PASSCOMMAND then remove BORG_PASSPHRASE (or borg will use that.)
+
+    #log "SALT := $(echo $SALT)" #without `export`
+    #log "PASSPHRASE := $(echo $BORG_PASSPHRASE)" # without `export`
+    #log "SALT := $SALT" # with `export`
+    #log "PASSPHRASE := $BORG_PASSPHRASE" # with `export`
+
+    #log "PASS_CMD := $(sh -c "printf \"%s\" \"$(echo $BORG_PASSCOMMAND)\"")"
+    BPC="$(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
+    #export BORG_PASSCOMMAND="echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'" # runs, (but is it actually using argon2?)
+    export BORG_PASSCOMMAND="$BPC"
+    #export BORG_PASSCOMMAND="$( sh -c "echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'")" # interpolates too far
+    #export BORG_PASSCOMMAND="$BORG_PASSCOMMAND" #fails
+    #PASS_CMD=$(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')
+    #log "PASS_CMD := $(echo $BORG_PASSCOMMAND|sed 's/\$SALT/'$SALT'/;s/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/')"
+    #log "PASS_CMD := $PASS_CMD"
+    #  WHY won't /bin/dash won't expand string variables like a nice normal shell!!
+
+    if [ "$BORG_PASSCOMMAND" ]; then
+        #log 1 "clearing $BORG_PASSPHRASE so that borg doesn't use it acidentally"
+        #log 1 "clearing BORG_PASSPHRASE to upgrate to $BORG_PASSCOMMAND"
+        # we can safely clear BORG_PASSPHRASE
+        unset BORG_PASSPHRASE
+    fi
+    #log 1 "we have safely cleared BPP:=[$BORG_PASSPHRASE] because we have BPC:=\"$BORG_PASSCOMMAND\""
+
+
+    # check that the BORG_REPO is available or init'ed
+
+    #[ -d "$BORG_REPO" ] && log 1 "storing the unimetrix at: $BORG_REPO" #DEBUG
+    
+    [ -d "$(dirname $BORG_REPO)" ]|| {
+        log "REPO save location [$BORG_REPO] is missing; did you forget to mount the NAS?"
+        exit 5
+    }
+
+    if [ ! -d "${BORG_REPO#file://}" ]; then
+      log 1 "borg init $BORG_REPO" >&2
+      #borg init --encryption=keyfile $BORG_REPO
+      borg init $INIT_FLAGS $BORG_REPO
+      borg upgrade --tam $BORG_REPO
+      borg key export $(date +%F_%T)_COPY_OF_YOUR_BORG.KEY
+      log 3 "You should make multiple safe copies of $(ls -l COPY_OF_YOUR_BORG.KEY)" 
+    fi
+
+    if [ -f "$BORG_REPO/lock.roster" ]&&[ ! "$(ps auwxf|grep -v grep|grep borg|awk '{print $2}')" ]; then
+     borg umount $BORG_REPO
+     borg break-lock $BORG_REPO
+    fi
+
+
+}
+second_sanity
+# DEBUG
+check_borg_env(){
+    #sed 's/.*MAIL=[^BORG]*//;s/LANG=.*//;s/\([^$]BORG_[^=]*=\)/\n\1/g' /proc/$(ps auwxf|grep borg|grep -v grep|awk '{print $2}')/environ; echo
+    #sed 's/.*MAIL=[^BORG]*//;s/LANG=.*//;s/\([^$]BORG_[^=]*=\)/\n\1/g' /proc/$(ps auwxf|grep cube|grep -v grep|awk '{print $2}')/environ; echo
+    log "$(cat /proc/$$/environ; echo)"
+    #log "$(sed 's/.*MAIL=[^BORG]*//;s/LANG=.*//;s/\([^$]BORG_[^=]*=\)/\n\1/g' /proc/$$/environ; echo)"
+    borg list $BORG_REPO
+}
+# check_borg_env #DEBUG
+
+#######################
+### getopt_simple() ###
+#######################
+
+#src=http://tldp.org/LDP/abs/html/string-manipulation.html
+getopt_simple()
+{
+    local DEBUG=0 # locally override
+    # because dash hates you: we can't use ${FUNCNAME[@]:0:${#FUNCNAME[@]}-1}
+    #  to deterime recursion depth
+    RECURSE_BLOCK=
+    if [ "$1" ]&& echo "$1"|grep -q "RECURSE_BLOCK"; then
+        RECURSE_BLOCK=1
+        shift
+    else
+        #log "getopt_simple() := [${FUNCNAME[@]:0:${#FUNCNAME[@]}-1}]" #bashism
+        log "getopt_simple()"
+        log "Parameters are '$*'"
+        log "[d] p0 1:= $1 2:= $2" >&2
+    fi
+    #LOOP_BREAK=0
+
+    until [ -z "$1" ];do
+      #LOOP_BREAK=$(( LOOP_BREAK + 1 ))
+      log 3 "[Processing] parameter of: '$1'"
+      #echo "[d] proc $1 $LOOP_BREAK" >&2
+      if echo "$1"|grep -q '^/' ;then
+          tmp=${1:1}               # Strip off leading '/' . . .
+          parameter=${tmp%%=*}     # Extract name.
+          value=${tmp##*=}         # Extract value.
+          log 3 "Parameter : '$parameter', value: '$value'"
+          eval $parameter=$value
+      elif echo "$1"|grep -q '^-' && echo "$1"|grep -q '=' ;then
+        tmp=$1
+        while echo "$tmp"|grep -q '^-';do
+            tmp=$(echo "$tmp"|sed 's/^-//')
+        done
+        parameter=${tmp%%=*}
+        value=${tmp##*=}
+          log 3 "Pbrameter: '$parameter', value: '$value'"
+         # echo "[d] pb $parameter=$value < $1" >&2
+          eval $parameter=$value
+      #elif [ ${1:0:1} = '-' ]
+      elif echo "$1"|grep -q '^-' ;then
+        #echo "[d] '$1' matched 'flag, maybe with an arg variable" >&2
+        tmp=$1
+        while echo "$tmp"|grep -q '^-' ;do
+            tmp=$(echo "$tmp"|sed 's/^-//')
+        done
+        parameter=$tmp
+        shift
+        if [ "$1" ] && echo "$1"|grep -vq '^-' ;then
+            value=$1
+        else
+            value=true
+        fi
+          log 3 "Pcrameter: '$parameter', value: '$value'"
+          #echo "[d1] pc $parameter=$value < $1" >&2
+          eval $parameter=$value
+        if echo "$value"|grep -q '^true$'; then
+            # we have to recurse to process the "value" 
+            # that turned out to be a "parameter"
+            if [ ! "$RECURSE_BLOCK" ]; then
+                log 3 "[d] RECURSING $*" >&2
+                if [ "$1" ]; then
+                    getopt_simple RECURSE_BLOCK $*
+                fi
+            fi
+         fi
+      else
+        log 2 "'$1' did not match any opts that we know of" >&2
+        shift
+        break
+      fi
+      #if [ "$LOOP_BREAK" -gt 20 ]||[ ! "$1" ]; then
+      #   echo "[w] break/continue/return $LOOP_BREAK for '$1'";
+      #   break
+      #fi
+      [ "$1" ]&& shift
+    done
+    #echo "[i] leaving getopt $LOOP_BREAK" >&2
+}
+# log "BEFORE getopt"
+
+getopt_simple $*
+
+#DEBUG=1 log "FINISHED getopt"
+#log "FINISHED getopt"
+
+#################################
+### /end of config processing ###
+###   and general boilerplate ###
+###                           ###
+### These are the actions:    ###
+#################################
+
+if [ "$export_key" ]||[ "$export" ]; then
+    borg key export $BORG_REPO $(date +%F_%T)_COPY_OF_YOUR_BORG.KEY
+    exit 0
+elif [ "$export_key_without_passphrase" ]; then
+    #BORG_PASSPHRASE=old BORG_NEW_PASSPHRASE= borg key change-passphrase repo
+    # blank the passphrase
+    STASH_BORG_PASSPHRASE=$(eval $BORG_PASSCOMMAND)
+    BORG_PASSPHRASE=$(eval $BORG_PASSCOMMAND)
+    BORG_NEW_PASSPHRASE= borg key change-passphrase $BORG_REPO
+    # export
+    borg key export $BORG_REPO $(date +%F_%T)_COPY_OF_YOUR_BORG.KEY
+    # reinstate
+    BORG_NEW_PASSPHRASE=$BORG_PASSPHARSE borg key change-passphrase $BORG_REPO
+    exit 0
+fi
+
+if [ "$info" ]||[ "$i" ]; then
+    borg info $BORG_REPO
+    exit 0
+fi
+
+if [ "$key_migrate_to_repokey" ]||[ "$migrate_to_repokey" ]||[ "$migrate" ]||[ "$kmtrk" ]||[ "$kmtr" ]; then
+    borg key migrate-to-repokey $BORG_REPO
+    exit 0
+fi
+
+if [ "$umount" ]||[ "$u" ]; then
+    borg umount $BORG_MNT && log 1 "borg cube unmounted successfully" || log 2 "failed to unmount cube: $?"
+    exit 0
+fi
+
+if [ "$check" ]||[ "$c" ]; then
+    borg check $BORG_REPO || log "Is it possible that you have this backup currently mounted?"
+    exit 0
+fi
+
+if [ "$recover" ]||[ "$r" ]; then
+    [ "$SECOND_MOST_RECENT" ]|| SECOND_MOST_RECENT=$(borg list $BORG_REPO|tail -n2|head -n1|awk '{print $1}')
+    if [ "$(ls -a $BORG_MNT|wc -l)" -gt 2 ]l; then
+        log 3 "Unable to mount land borg cube at $BORG_MNT; maybe it is occupied?"
+    elif [ "$SECOND_MOST_RECENT" ]; then
+        [ -d "$BORG_MNT" ]|| mkdir -p $BORG_MNT
+        borg mount $BORG_REPO::$SECOND_MOST_RECENT $BORG_MNT
+        ls $BORG_MNT && log 1 "backup mounted on $BORG_MNT; Remember to $0 -unmount after you have recovered your file(s)" || \
+        log -3 "[error] Failed to mount backup on $BORG_MNT: $?"
+    else
+        log 2 'Make more backups or call with -SECOND_MOST_RECENT="backup_that_you_want_to_mount"'
+    fi
+    exit 0
+fi
+
+if [ "$test" ]||[ "$t" ]; then
+    [ "$MOST_RECENT" ]|| MOST_RECENT=$(borg list $BORG_REPO|tail -n1|awk '{print $1}')
+    [ -d "$BORG_MNT" ]|| mkdir -p $BORG_MNT
+    borg mount $BORG_REPO::$MOST_RECENT $BORG_MNT && log 2 "most recent backup mounted at $BORG_MNT"
+    exit $?
+fi
+
+if [ "$list" ]||[ "$list_repo" ]||[ "$ls" ]||[ "$lr" ]||[ "$l" ]; then
+    borg list $BORG_REPO
+    exit 0
+fi
+
+if [ "$show_passphrase" ]||[ "$show_pass" ]||[ "$show" ]||[ "$s" ]; then
+    log 1 "BORG_PASSPHRASE=$BORG_PASSPHRASE"
+    log 1 "BORG_PASSCOMMAND=$BORG_PASSCOMMAND"
+    exit 0
+fi
+
+if [ "$BORG_NEW_PASSPHRASE" ]||[ "$OLD_PASSPHRASE" ]; then
+    log 1 "Going to try to change the passphrase for REPO $BORG_REPO"
+    BORG_PASSPHRASE=$OLD_PASSPHRASE BORG_NEW_PASSPHRASE=$BORG_NEW_PASSPHARSE borg key change-passphrase $BORG_REPO
+    exit $?
+#else
+#    log "BNPP:= $BORG_NEW_PASSPHRASE ; OPP := $OLD_PASSPHRASE"
+#    exit 99
+fi
+
+
+### run borg ###
+# gather the pices and see if borg will "create"
+
+info "Starting backup to $BORG_REPO"
+
+borg create $CREATE_FLAGS $E $ARCHIVE_NAME $INC
+
+backup_exit=$?
+
+# now we "prune"
+
+info "Pruning repository"
+
+# Use the `prune` subcommand to maintain 7 daily, 4 weekly and 6 monthly
+# archives of THIS machine. The '{hostname}-' prefix is very important to
+# limit prune's operation to this machine's archives and not apply to
+# other machines' archives also:
+
+# TODO ensure that the --prefix matches the one being used in $ARCHIVE_NAME by CREATE
+
+borg prune $PRUNE_FLAGS
+
+prune_exit=$?
+
+# actually free repo disk space by compacting segments
+
+
+compact_exit=
+if [ "$(borg -h|grep compact)" ]; then
+    info "Compacting repository"
+    borg compact
+    compact_exit=$?
+fi
+
+# use highest exit code as global exit code
+global_exit=$(( backup_exit > prune_exit ? backup_exit : prune_exit ))
+global_exit=$(( compact_exit > global_exit ? compact_exit : global_exit ))
+
+if [ ${global_exit} -eq 0 ]; then
+    if [ "$compact_exim" ]; then
+        info "Backup, Prune, and Compact finished successfully"
+    else
+        info "Backup and Prune finished successfully"
+    fi
+elif [ ${global_exit} -eq 1 ]; then
+    info "Backup, Prune, and/or Compact finished with warnings"
+else
+    log " Backup and/or Prune finished with an error"
+    log " if you saw 'Repository has no manifest.' then \`rm -rf $BORG_REPO\` and start again"
+fi
+
+exit ${global_exit}
+
+# TODO: if called with -export bundle up the key material required to recover the BORG_REPO on another computer
+# NTS or we can just use `borg init --encryption repokey-blake2 $BORG_REPO` and not bother with messy keys?
+
+#### Helper functions, that remind you how to recover your data by hand, in a pinich
+
+desktop_notify(){
+ echo $(time archive 1>/tmp/$(whoami)_archive.log 2>/tmp/$(whoami)_archive.err ) 2>&1 1>/tmp/$(whoami)_archive.time ; gxmessage -buttons "GTK_STOCK_OK:0" -default GTK_STOCK_OK -center "$0 finished"
+}
+
+inspect_archive() {
+        # to recover we need a valid $BORG_PASSCOMMAND, to do that we export the SALT and BORG_PASSPHRASE
+        export $(grep ^SALT ~/.config/cube/config.ini)
+        export $(grep ^BORG_PASSPHRASE ~/.config/cube/config.ini);
+        export $(grep ^BORG_REPO ~/.config/cube/config.ini|tr -d '"')
+        grep ^BORG_PASSC ~/.config/cube/config.ini|sed 's/\$BORG_PASSPHRASE/'$BORG_PASSPHRASE'/'|tr -d '"'|sed 's/=/="/;s/$/"/'
+        unset BORG_PASSPHRASE;borg list $BORG_REPO
+
+        [ "$SECOND_MOST_RECENT" ]|| SECOND_MOST_RECENT=$(borg list $BORG_REPO|tail -n2|head -n1|awk '{print $1}')
+        mkdir -p ~/.mnt/g/
+        borg mount $BORG_REPO::$SECOND_MOST_RECENT ~/.mnt/g/
+        ls ~/.mnt/g/
+        # rsync -mauvPAX ~/.mnt/g/home/$(whoami)/vital/files.txt  ~/vital/files.txt 
+        # You can get borg to extract a single file:
+        #  borg extract /mnt/backup/borg_repo::myserver-system-2019-08-11 path/to/extract 
+        #  (N.B. no leading "/" on the path), but seeing the files dir can help
+        borg umount ~/.mnt/g/
+}
+recover() {
+        sudo apt install -y argon2 rsync jq borgbackup
+        HOST=$([ "${HOSTNAME}" ]&& printf $HOSTNAME || printf 'acer')
+        eval "$(grep -E '^SALT|^export' $(which archive))"; mkdir -p ~/.mnt/g/ 2>/dev/null
+        rsync -mauvPAX ${BORG_REPO%/*}/borg_${HOST}_keys/keys  ~/.config/borg/
+        borg mount ${BORG_REPO}::$(borg list|grep ${HOST}|tail -n2|head -n1|awk '{print $1}') ~/.mnt/g/
+        # rsync -mauvPAX ~/.mnt/g/home/$(whoami)/vital/files.txt  ~/vital/files.txt 
+        borg umount ~/.mnt/g/
+}
+NTS(){
+        # if you get "Repository has no manifest" while creating a new borg repo
+        #    then you can try to recover with:
+        #   `borg delete –cache-only $BORG_REPO; borg check –repair $BORG_REPO` 
+        #
+        #   or recover from an older archive [https://borgbackup.readthedocs.io/en/stable/faq.html#my-repository-is-corrupt-how-can-i-restore-from-an-older-copy-of-it]
+        #   borg delete --keep-security-info /path/to/repo
+        #   rsync -aH /path/to/repo-working/ /path/to/repo  # Note the trailing slash.
+        #
+        #   or scrub the REPO and start again with: `rm -rf $BORG_REPO` because it is corrupted
+        printf
+}
