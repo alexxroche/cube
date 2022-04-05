@@ -17,6 +17,7 @@ which b2sum >/dev/null && b2sum -c ~/.local/bin/.cube.b2 && ~/.local/bin/cube \
 || { 
     sha256sum -c ~/.local/bin/.cube.sha256 && ~/.local/bin/cube || echo "[e] cube hashes failed. Do not use" 
 }
+
 ```
 
 ### ABOUT
