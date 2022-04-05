@@ -169,7 +169,8 @@ ARCHIVE_NAME="::'{hostname}_{utcnow:%Y-%m-%d_%H:%M:%S}'"
 #EOF
 
 #INIT_FLAGS="--encryption=repokey" # legacy
-INIT_FLAGS="--encryption keyfile-blake2"
+#INIT_FLAGS="--encryption keyfile-blake2" # better security but fussy; easier to use repokey-blake2
+INIT_FLAGS="--encryption repokey-blake2"
 CREATE_FLAGS="--verbose --filter AME --list --stats --show-rc --compression zstd,22 --exclude-caches" # max compression
 #CREATE_FLAGS="--verbose --filter AME --list --stats --show-rc --compression lzma,9 --exclude-caches" # legacy compatability
 PRUNE_FLAGS=" --list --prefix '{hostname}_' --show-rc --keep-hourly 2 --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-yearly 100"
